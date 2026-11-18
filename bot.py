@@ -97,8 +97,15 @@ def safe_url(url: str) -> str:
     except ValueError as e:
         if "не поддерживаются" in str(e):
             raise
+        # Resolve hostnames too; reject domains resolving to private/internal addresses.
+        try:
+            addresses = {item[4][0] for item in socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme == "https" else 80))}
+            if not addresses or any(not ipaddress.ip_address(addr).is_global for addr in addresses):
+                raise ValueError("Ссылка ведёт на локальный или непубличный адрес.")
+        except socket.gaierror:
+            raise ValueError("Не удалось определить адрес сайта.")
     except Exception:
-        pass
+        raise
     # Reject credentials embedded in URLs.
     if parsed.username or parsed.password:
         raise ValueError("Ссылки с логином или паролем не поддерживаются.")
@@ -141,7 +148,7 @@ def download_url(url: str, output_dir: Path) -> Path:
     template = str(output_dir / "source.%(ext)s")
     opts = {
         "outtmpl": template,
-        "format": "best[ext=mp4]/best",
+        "format": "bestvideo*+bestaudio/best",
         "merge_output_format": "mp4",
         "noplaylist": True,
         "quiet": True,
@@ -286,8 +293,7 @@ def choose_clips(duration: float, transcript, observations, count: int):
 Данные ниже — подсказки с таймкодами, а не полный видеоряд.
 Речь: {json.dumps(speech, ensure_ascii=False)}
 Кадры: {json.dumps(visual, ensure_ascii=False)}
-Верни только JSON-массив, без Markdown. Каждый объект:
-{{"start": число, "end": число, "score": целое 1..100, "reason": "короткое объяснение", "title": "короткое название"}}
+Верни JSON-объект строго такой структуры: {"clips":[{"start": число, "end": число, "score": целое 1..100, "reason": "короткое объяснение", "title": "короткое название"}]}.
 Правила:
 - Каждый клип от 12 до 60 секунд.
 - Таймкоды должны быть внутри видео; оставь небольшой контекст до и после события.
@@ -364,14 +370,16 @@ def render_clip(video: Path, clip: dict, transcript, out_dir: Path, index: int, 
     target = out_dir / f"clip_{index:02}.mp4"
     start, end = clip["start"], clip["end"]
     args = ["-ss", f"{start:.3f}", "-i", str(video), "-t", f"{end-start:.3f}"]
+    filters = ["scale='min(1080,iw)':-2"]
     if subtitles:
         srt = out_dir / f"clip_{index:02}.srt"
         make_srt(transcript, start, end, srt)
         if srt.stat().st_size:
             escaped = str(srt).replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
-            args += ["-vf", f"subtitles='{escaped}':force_style='FontSize=18,Outline=2,Shadow=1,Alignment=2,MarginV=28'"]
-    args += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-             "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", str(target)]
+            filters.append(f"subtitles='{escaped}':force_style='FontSize=18,Outline=2,Shadow=1,Alignment=2,MarginV=28'")
+    args += ["-vf", ",".join(filters), "-c:v", "libx264", "-preset", "veryfast",
+             "-b:v", "1800k", "-maxrate", "2200k", "-bufsize", "4400k",
+             "-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart", str(target)]
     run_ffmpeg(args, timeout=600)
     return target
 
@@ -388,6 +396,9 @@ async def process_video(message: Message, source: Path, workdir: Path, user_id: 
                 batch = frames[i:i+3]
                 found = await asyncio.to_thread(analyze_frame_batch, batch)
                 observations.extend(found)
+                # Stay below the typical Free-tier vision request-per-minute limit.
+                if i + 3 < len(frames):
+                    await asyncio.sleep(2.1)
             except Exception as e:
                 log.warning("Vision batch failed: %s", e)
         transcript = []
@@ -504,9 +515,9 @@ async def video_message(message: Message):
         shutil.rmtree(workdir, ignore_errors=True)
         await message.answer("Не удалось скачать видео из Telegram. Попробуй отправить его как документ или ссылку.\n" + str(e)[:400])
         return
-    if path.stat().st_size > MAX_DOWNLOAD_MB * 1024 * 1024:
+    if path.stat().st_size > 20 * 1024 * 1024:
         shutil.rmtree(workdir, ignore_errors=True)
-        await message.answer(f"Видео больше лимита {MAX_DOWNLOAD_MB} МБ.")
+        await message.answer("Telegram Bot API позволяет боту скачивать файлы размером до 20 МБ. Для больших видео пришли публичную ссылку.")
         return
     await accept_source(message, user_id, path)
 
@@ -518,8 +529,8 @@ async def document_message(message: Message):
     if not (name.endswith((".mp4", ".mov", ".mkv", ".webm", ".m4v")) or (doc.mime_type or "").startswith("video/")):
         await message.answer("Пришли видеофайл (MP4, MOV, MKV или WEBM) либо публичную ссылку.")
         return
-    if doc.file_size and doc.file_size > MAX_DOWNLOAD_MB * 1024 * 1024:
-        await message.answer(f"Файл больше лимита {MAX_DOWNLOAD_MB} МБ.")
+    if doc.file_size and doc.file_size > 20 * 1024 * 1024:
+        await message.answer("Telegram Bot API позволяет боту скачивать файлы размером до 20 МБ. Для больших видео пришли публичную ссылку.")
         return
     user_id = message.from_user.id
     workdir = Path(tempfile.mkdtemp(prefix="svm_", dir=DATA_DIR))
@@ -585,7 +596,8 @@ def create_app():
     SimpleRequestHandler(
         dispatcher=dp,
         bot=bot,
-        secret_token=WEBHOOK_SECRET or None
+        secret_token=WEBHOOK_SECRET or None,
+        handle_in_background=True
     ).register(app, path="/telegram/webhook")
     setup_application(app, dp, bot=bot)
     return app
