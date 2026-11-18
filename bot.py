@@ -175,7 +175,7 @@ def extract_frames(video: Path, out_dir: Path, duration: float):
     # Evenly sample the whole timeline; cap API calls and processing time.
     count = min(180, max(1, int(duration // SAMPLE_INTERVAL) + 1))
     interval = max(SAMPLE_INTERVAL, duration / count)
-    timestamps = [min(duration - 0.2, i * interval) for i in range(count)]
+    timestamps = [max(0.0, min(duration - 0.2, i * interval)) for i in range(count)]
     paths = []
     for idx, ts in enumerate(timestamps):
         target = frames_dir / f"frame_{idx:04d}.jpg"
@@ -293,7 +293,7 @@ def choose_clips(duration: float, transcript, observations, count: int):
 Данные ниже — подсказки с таймкодами, а не полный видеоряд.
 Речь: {json.dumps(speech, ensure_ascii=False)}
 Кадры: {json.dumps(visual, ensure_ascii=False)}
-Верни JSON-объект строго такой структуры: {"clips":[{"start": число, "end": число, "score": целое 1..100, "reason": "короткое объяснение", "title": "короткое название"}]}.
+Верни JSON-объект строго такой структуры: {{"clips":[{{"start": число, "end": число, "score": целое 1..100, "reason": "короткое объяснение", "title": "короткое название"}}]}}.
 Правила:
 - Каждый клип от 12 до 60 секунд.
 - Таймкоды должны быть внутри видео; оставь небольшой контекст до и после события.
@@ -506,6 +506,9 @@ async def help_callback(callback: CallbackQuery):
 @dp.message(F.video)
 async def video_message(message: Message):
     user_id = message.from_user.id
+    if message.video.file_size and message.video.file_size > 20 * 1024 * 1024:
+        await message.answer("Telegram Bot API позволяет боту скачивать файлы размером до 20 МБ. Для больших видео пришли публичную ссылку.")
+        return
     workdir = Path(tempfile.mkdtemp(prefix="svm_", dir=DATA_DIR))
     path = workdir / "uploaded_video.mp4"
     try:
