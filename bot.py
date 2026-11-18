@@ -585,17 +585,11 @@ async def on_startup(app):
     log.info("Telegram webhook configured")
 
 
-async def on_shutdown(app):
-    await bot.delete_webhook()
-    await bot.session.close()
-
-
 def create_app():
     app = web.Application()
     app.router.add_get("/", health)
     app.router.add_get("/health", health)
     app.on_startup.append(on_startup)
-    app.on_shutdown.append(on_shutdown)
     SimpleRequestHandler(
         dispatcher=dp,
         bot=bot,
