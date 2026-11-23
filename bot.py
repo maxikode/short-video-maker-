@@ -301,23 +301,45 @@ def choose_clips(duration: float, transcript, observations, count: int):
 - Оценивай честно: score — оценка потенциальной интересности, а не гарантия популярности.
 - Если хороших моментов меньше {count}, верни меньше, не заполняй список случайными отрывками.
 """
+    # Avoid Groq server-side JSON validation: an empty or malformed model
+    # generation can fail the whole request before local recovery is possible.
     result = groq.chat.completions.create(
         model=GROQ_TEXT_MODEL,
         messages=[
-            {"role": "system", "content": "Ты аккуратный видеоредактор. Возвращай только корректный JSON."},
+            {
+                "role": "system",
+                "content": (
+                    "Ты аккуратный видеоредактор. Ответь только одним JSON-объектом "
+                    'в формате {"clips":[...]}. Не добавляй Markdown или пояснения. '
+                    'Если подходящих моментов нет, верни {"clips":[]} .'
+                ),
+            },
             {"role": "user", "content": prompt},
         ],
-        temperature=0.2,
+        temperature=0.1,
         max_completion_tokens=2500,
-        response_format={"type": "json_object"},
     )
-    raw = result.choices[0].message.content or "{}"
+    raw = (result.choices[0].message.content or "").strip()
+    if not raw:
+        raise RuntimeError(
+            "Groq вернул пустой ответ при выборе клипов. "
+            "Попробуй ещё раз или проверь доступность текстовой модели."
+        )
+    # Accept plain JSON and JSON wrapped in Markdown code fences.
+    raw = re.sub(r"^\s*\x60{3}(?:json)?\s*|\s*\x60{3}\s*$", "", raw, flags=re.IGNORECASE)
     try:
         data = json.loads(raw)
-        clips = data.get("clips", []) if isinstance(data, dict) else data
-    except Exception:
-        match = re.search(r"\[[\s\S]*\]", raw)
-        clips = json.loads(match.group(0)) if match else []
+    except json.JSONDecodeError:
+        match = re.search(r"\{[\s\S]*\}", raw)
+        if not match:
+            raise RuntimeError("Groq вернул ответ не в формате JSON. Попробуй ещё раз.")
+        try:
+            data = json.loads(match.group(0))
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("Groq вернул некорректный JSON при выборе клипов. Попробуй ещё раз.") from exc
+    clips = data.get("clips", []) if isinstance(data, dict) else data
+    if not isinstance(clips, list):
+        raise RuntimeError("Groq вернул JSON без корректного списка clips. Попробуй ещё раз.")
     cleaned = []
     for item in clips:
         try:
