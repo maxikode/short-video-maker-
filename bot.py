@@ -305,7 +305,7 @@ def choose_clips(duration: float, transcript, observations, count: int):
     # generation can fail the whole request before local recovery is possible.
     # Groq recommends putting instructions in the user message for reasoning models.
     prompt += (
-        "\\n\\nВАЖНО: верни только один корректный JSON-объект формата "
+        "\n\nВАЖНО: верни только один корректный JSON-объект формата "
         '{"clips":[{"start":0,"end":15,"score":80,"reason":"...","title":"..."}]}. '
         'Без Markdown и дополнительного текста. Если подходящих моментов нет — {"clips":[]}.'
     )
