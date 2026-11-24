@@ -274,51 +274,131 @@ def probe_audio_duration(path: Path):
     return float(p.stdout.strip() or 0)
 
 
+def fallback_choose_clips(duration: float, transcript, observations, count: int):
+    """Build reasonable non-overlapping clips if Groq returns no usable choices."""
+    if duration < MIN_CLIP_SECONDS:
+        return []
+
+    window_len = min(MAX_CLIP_SECONDS, max(30.0, MIN_CLIP_SECONDS))
+    window_len = min(window_len, duration)
+    anchors = []
+
+    speech_items = []
+    for seg in transcript or []:
+        try:
+            start = max(0.0, float(seg.get("start", 0)))
+            end = min(duration, float(seg.get("end", start)))
+            if end <= start:
+                continue
+            text = re.sub(r"\\s+", " ", str(seg.get("text", ""))).strip()
+            speech_items.append({"start": start, "end": end, "text": text})
+        except (TypeError, ValueError):
+            continue
+
+    visual_items = []
+    for item in observations or []:
+        try:
+            ts = max(0.0, min(duration, float(item.get("time", 0))))
+            description = str(item.get("observation", "")).strip()
+            if description:
+                visual_items.append({"time": ts, "text": description})
+        except (TypeError, ValueError):
+            continue
+
+    def add_anchor(center, score, title, reason):
+        start = max(0.0, min(duration - window_len, center - window_len / 2))
+        end = min(duration, start + window_len)
+        if end - start >= MIN_CLIP_SECONDS:
+            anchors.append({
+                "start": start,
+                "end": end,
+                "score": max(1, min(100, int(score))),
+                "title": title,
+                "reason": reason,
+            })
+
+    exciting = re.compile(
+        r"смех|сме[её]т|шут|смеш|неожидан|удив|вау|побед|ошиб|реакц|"
+        r"эмоц|крич|спор|важн|резк|laugh|funny|wow|surpris|reaction|win|fail",
+        re.IGNORECASE,
+    )
+
+    for seg in speech_items:
+        center = (seg["start"] + seg["end"]) / 2
+        left, right = center - window_len / 2, center + window_len / 2
+        nearby = [x for x in speech_items if x["end"] >= left and x["start"] <= right]
+        word_count = sum(len(x["text"].split()) for x in nearby)
+        combined = " ".join(x["text"] for x in nearby)
+        score = 44 + min(22, word_count // 8) + (12 if exciting.search(combined) else 0)
+        add_anchor(
+            center, score, "Момент с активной речью",
+            "Резервный выбор по активности и содержанию речи; оценка приблизительная."
+        )
+
+    for item in visual_items:
+        center = item["time"]
+        nearby = [x for x in visual_items if abs(x["time"] - center) <= window_len / 2]
+        combined = " ".join(x["text"] for x in nearby)
+        score = 48 + min(18, len(nearby) * 3) + (12 if exciting.search(combined) else 0)
+        add_anchor(
+            center, score, "Заметный визуальный момент",
+            "Резервный выбор по описаниям кадров; оценка приблизительная."
+        )
+
+    # If several anchors point to the same section, keep only its strongest candidate.
+    anchors.sort(key=lambda x: x["score"], reverse=True)
+    selected = []
+    for item in anchors:
+        if all(item["end"] <= old["start"] or item["start"] >= old["end"] for old in selected):
+            selected.append(item)
+        if len(selected) >= count:
+            break
+    selected.sort(key=lambda x: x["start"])
+    return selected
+
+
 def choose_clips(duration: float, transcript, observations, count: int):
     # Keep the prompt compact while preserving timestamps.
     speech = [
         {"start": round(float(x["start"]), 1), "end": round(float(x["end"]), 1),
-         "text": str(x["text"])[:350]}
-        for x in transcript[:350]
+         "text": str(x["text"])[:250]}
+        for x in transcript[:250]
     ]
     visual = [
         {"time": round(float(x.get("time", 0)), 1),
-         "observation": str(x.get("observation", ""))[:180]}
-        for x in observations[:120]
+         "observation": str(x.get("observation", ""))[:160]}
+        for x in observations[:100]
     ]
     prompt = f"""
-Найди до {count} лучших самостоятельных коротких фрагментов из видео длительностью {duration:.1f} секунд.
-Выбирай реальные интересные события: юмор, неожиданность, сильная реакция, напряжённый игровой момент,
-необычное действие или запоминающаяся фраза. Не называй обычные паузы интересными.
+Ты помогаешь выбрать интересные моменты из видео длительностью {duration:.1f} секунд.
+Нужно выбрать до {count} клипов. Не будь чрезмерно строгим: если есть связная речь,
+действие или заметное событие, выбери подходящий фрагмент. Не возвращай пустой список,
+если в данных есть хотя бы один пригодный момент.
 Данные ниже — подсказки с таймкодами, а не полный видеоряд.
 Речь: {json.dumps(speech, ensure_ascii=False)}
 Кадры: {json.dumps(visual, ensure_ascii=False)}
-Верни JSON-объект строго такой структуры: {{"clips":[{{"start": число, "end": число, "score": целое 1..100, "reason": "короткое объяснение", "title": "короткое название"}}]}}.
+Верни только JSON-объект с ключом clips. Каждый элемент должен иметь:
+start (секунды), end (секунды), score (целое 1..100), reason (краткая причина),
+title (короткое название).
 Правила:
-- Каждый клип от 12 до 60 секунд.
-- Таймкоды должны быть внутри видео; оставь небольшой контекст до и после события.
-- Не перекрывай клипы друг с другом; избегай почти одинаковых моментов.
-- Оценивай честно: score — оценка потенциальной интересности, а не гарантия популярности.
-- Если хороших моментов меньше {count}, верни меньше, не заполняй список случайными отрывками.
+- Длительность клипа от 12 до 60 секунд.
+- Все таймкоды должны находиться внутри видео.
+- Выбирай наиболее содержательные фрагменты, но не требуй, чтобы момент был сенсационным.
+- Не перекрывай клипы. Если видео короткое, верни один лучший фрагмент.
+- Если данных мало, выбери наиболее осмысленный фрагмент, а не пустой список.
 """
-    # Avoid Groq server-side JSON validation: an empty or malformed model
-    # generation can fail the whole request before local recovery is possible.
-    # Groq recommends putting instructions in the user message for reasoning models.
     prompt += (
-        "\n\nВАЖНО: верни только один корректный JSON-объект формата "
-        '{"clips":[{"start":0,"end":15,"score":80,"reason":"...","title":"..."}]}. '
-        'Без Markdown и дополнительного текста. Если подходящих моментов нет — {"clips":[]}.'
+        "\n\nФормат ответа: "
+        '{"clips":[{"start":0,"end":20,"score":70,"reason":"Краткая причина","title":"Название"}]}. '
+        'Если видео короче 12 секунд, верни {"clips":[]}.'
     )
-    messages = [{"role": "user", "content": prompt}]
 
-    # GPT-OSS spends part of max_completion_tokens on hidden reasoning.
-    # A small budget can therefore end with content=null and finish_reason=length.
     result = None
     raw = ""
     for attempt, token_budget in enumerate((6000, 8000), start=1):
         result = groq.chat.completions.create(
             model=GROQ_TEXT_MODEL,
-            messages=messages,
+            messages=[{"role": "user", "content": prompt}],
             temperature=0.1,
             reasoning_effort="low",
             reasoning_format="hidden",
@@ -333,31 +413,30 @@ def choose_clips(duration: float, transcript, observations, count: int):
             "Groq returned empty clip-selection output: attempt=%s finish_reason=%s usage=%s",
             attempt, choice.finish_reason, getattr(result, "usage", None)
         )
-        if attempt == 1:
-            log.info("Retrying clip selection with a larger completion-token budget.")
+
     if not raw:
-        choice = result.choices[0]
-        finish_reason = getattr(choice, "finish_reason", "unknown")
-        raise RuntimeError(
-            "Groq не выдал текстовый ответ для выбора клипов "
-            f"(finish_reason={finish_reason}). Возможно, лимита токенов не хватило "
-            "на анализ. Попробуй более короткое видео или повтори попытку."
-        )
-    # Accept plain JSON and JSON wrapped in Markdown code fences.
-    raw = re.sub(r"^\s*\x60{3}(?:json)?\s*|\s*\x60{3}\s*$", "", raw, flags=re.IGNORECASE)
+        log.warning("Groq gave no clip-selection content; using local fallback.")
+        return fallback_choose_clips(duration, transcript, observations, count)
+
+    raw = re.sub(r"^\\s*\\x60{3}(?:json)?\\s*|\\s*\\x60{3}\\s*$", "", raw, flags=re.IGNORECASE)
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
-        match = re.search(r"\{[\s\S]*\}", raw)
+        match = re.search(r"\\{[\\s\\S]*\\}", raw)
         if not match:
-            raise RuntimeError("Groq вернул ответ не в формате JSON. Попробуй ещё раз.")
+            log.warning("Groq response did not contain a JSON object; using local fallback.")
+            return fallback_choose_clips(duration, transcript, observations, count)
         try:
             data = json.loads(match.group(0))
-        except json.JSONDecodeError as exc:
-            raise RuntimeError("Groq вернул некорректный JSON при выборе клипов. Попробуй ещё раз.") from exc
+        except json.JSONDecodeError:
+            log.warning("Groq returned malformed JSON; using local fallback.")
+            return fallback_choose_clips(duration, transcript, observations, count)
+
     clips = data.get("clips", []) if isinstance(data, dict) else data
     if not isinstance(clips, list):
-        raise RuntimeError("Groq вернул JSON без корректного списка clips. Попробуй ещё раз.")
+        log.warning("Groq JSON did not contain a clips list; using local fallback.")
+        return fallback_choose_clips(duration, transcript, observations, count)
+
     cleaned = []
     for item in clips:
         try:
@@ -375,14 +454,20 @@ def choose_clips(duration: float, transcript, observations, count: int):
                 })
         except (KeyError, TypeError, ValueError):
             continue
+
     cleaned.sort(key=lambda x: x["score"], reverse=True)
-    result = []
+    selected = []
     for item in cleaned:
-        if all(item["end"] <= old["start"] or item["start"] >= old["end"] for old in result):
-            result.append(item)
-        if len(result) >= count:
+        if all(item["end"] <= old["start"] or item["start"] >= old["end"] for old in selected):
+            selected.append(item)
+        if len(selected) >= count:
             break
-    return result
+
+    if not selected:
+        log.warning("Groq returned no valid clip timestamps; using local fallback.")
+        return fallback_choose_clips(duration, transcript, observations, count)
+
+    return sorted(selected, key=lambda x: x["start"])
 
 
 def make_srt(transcript, start: float, end: float, path: Path):
@@ -450,7 +535,10 @@ async def process_video(message: Message, source: Path, workdir: Path, user_id: 
             raise RuntimeError("Не удалось получить данные для анализа. Проверь, что Groq поддерживает выбранные модели.")
         clips = await asyncio.to_thread(choose_clips, duration, transcript, observations, s["count"])
         if not clips:
-            await message.answer("Не удалось уверенно найти подходящие моменты. Попробуй другое видео или измени модели Groq.")
+            await message.answer(
+                "Не получилось автоматически определить подходящие фрагменты. "
+                "В этом видео недостаточно распознанной речи или описаний кадров."
+            )
             return
         await message.answer(f"✂️ Нашёл {len(clips)} моментов. Нарезаю клипы…")
         for idx, clip in enumerate(clips, 1):
