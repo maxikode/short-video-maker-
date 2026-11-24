@@ -279,12 +279,12 @@ def choose_clips(duration: float, transcript, observations, count: int):
     speech = [
         {"start": round(float(x["start"]), 1), "end": round(float(x["end"]), 1),
          "text": str(x["text"])[:350]}
-        for x in transcript[:900]
+        for x in transcript[:350]
     ]
     visual = [
         {"time": round(float(x.get("time", 0)), 1),
-         "observation": str(x.get("observation", ""))[:220]}
-        for x in observations[:180]
+         "observation": str(x.get("observation", ""))[:180]}
+        for x in observations[:120]
     ]
     prompt = f"""
 Найди до {count} лучших самостоятельных коротких фрагментов из видео длительностью {duration:.1f} секунд.
@@ -303,27 +303,48 @@ def choose_clips(duration: float, transcript, observations, count: int):
 """
     # Avoid Groq server-side JSON validation: an empty or malformed model
     # generation can fail the whole request before local recovery is possible.
-    result = groq.chat.completions.create(
-        model=GROQ_TEXT_MODEL,
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "Ты аккуратный видеоредактор. Ответь только одним JSON-объектом "
-                    'в формате {"clips":[...]}. Не добавляй Markdown или пояснения. '
-                    'Если подходящих моментов нет, верни {"clips":[]} .'
-                ),
-            },
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.1,
-        max_completion_tokens=2500,
-    )
-    raw = (result.choices[0].message.content or "").strip()
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Ты аккуратный видеоредактор. Ответь только одним JSON-объектом "
+                'в формате {"clips":[...]}. Не добавляй Markdown или пояснения. '
+                'Если подходящих моментов нет, верни {"clips":[]} . '
+                "Не объясняй ход рассуждений, сразу сформируй результат."
+            ),
+        },
+        {"role": "user", "content": prompt},
+    ]
+
+    # GPT-OSS spends part of max_completion_tokens on hidden reasoning.
+    # A small budget can therefore end with content=null and finish_reason=length.
+    result = None
+    raw = ""
+    for attempt, token_budget in enumerate((6000, 8000), start=1):
+        result = groq.chat.completions.create(
+            model=GROQ_TEXT_MODEL,
+            messages=messages,
+            temperature=0.1,
+            reasoning_effort="low",
+            max_completion_tokens=token_budget,
+        )
+        choice = result.choices[0]
+        raw = (choice.message.content or "").strip()
+        if raw:
+            break
+        log.warning(
+            "Groq returned empty clip-selection output: attempt=%s finish_reason=%s usage=%s",
+            attempt, choice.finish_reason, getattr(result, "usage", None)
+        )
+        if attempt == 1:
+            log.info("Retrying clip selection with a larger completion-token budget.")
     if not raw:
+        choice = result.choices[0]
+        finish_reason = getattr(choice, "finish_reason", "unknown")
         raise RuntimeError(
-            "Groq вернул пустой ответ при выборе клипов. "
-            "Попробуй ещё раз или проверь доступность текстовой модели."
+            "Groq не выдал текстовый ответ для выбора клипов "
+            f"(finish_reason={finish_reason}). Возможно, лимита токенов не хватило "
+            "на анализ. Попробуй более короткое видео или повтори попытку."
         )
     # Accept plain JSON and JSON wrapped in Markdown code fences.
     raw = re.sub(r"^\s*\x60{3}(?:json)?\s*|\s*\x60{3}\s*$", "", raw, flags=re.IGNORECASE)
