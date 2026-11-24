@@ -303,18 +303,13 @@ def choose_clips(duration: float, transcript, observations, count: int):
 """
     # Avoid Groq server-side JSON validation: an empty or malformed model
     # generation can fail the whole request before local recovery is possible.
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "Ты аккуратный видеоредактор. Ответь только одним JSON-объектом "
-                'в формате {"clips":[...]}. Не добавляй Markdown или пояснения. '
-                'Если подходящих моментов нет, верни {"clips":[]} . '
-                "Не объясняй ход рассуждений, сразу сформируй результат."
-            ),
-        },
-        {"role": "user", "content": prompt},
-    ]
+    # Groq recommends putting instructions in the user message for reasoning models.
+    prompt += (
+        "\\n\\nВАЖНО: верни только один корректный JSON-объект формата "
+        '{"clips":[{"start":0,"end":15,"score":80,"reason":"...","title":"..."}]}. '
+        'Без Markdown и дополнительного текста. Если подходящих моментов нет — {"clips":[]}.'
+    )
+    messages = [{"role": "user", "content": prompt}]
 
     # GPT-OSS spends part of max_completion_tokens on hidden reasoning.
     # A small budget can therefore end with content=null and finish_reason=length.
@@ -326,6 +321,8 @@ def choose_clips(duration: float, transcript, observations, count: int):
             messages=messages,
             temperature=0.1,
             reasoning_effort="low",
+            reasoning_format="hidden",
+            response_format={"type": "json_object"},
             max_completion_tokens=token_budget,
         )
         choice = result.choices[0]
