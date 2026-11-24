@@ -290,7 +290,7 @@ def fallback_choose_clips(duration: float, transcript, observations, count: int)
             end = min(duration, float(seg.get("end", start)))
             if end <= start:
                 continue
-            text = re.sub(r"\\s+", " ", str(seg.get("text", ""))).strip()
+            text = re.sub(r"\s+", " ", str(seg.get("text", ""))).strip()
             speech_items.append({"start": start, "end": end, "text": text})
         except (TypeError, ValueError):
             continue
@@ -418,11 +418,11 @@ title (короткое название).
         log.warning("Groq gave no clip-selection content; using local fallback.")
         return fallback_choose_clips(duration, transcript, observations, count)
 
-    raw = re.sub(r"^\\s*\\x60{3}(?:json)?\\s*|\\s*\\x60{3}\\s*$", "", raw, flags=re.IGNORECASE)
+    raw = re.sub(r"^\s*\x60{3}(?:json)?\s*|\s*\x60{3}\s*$", "", raw, flags=re.IGNORECASE)
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
-        match = re.search(r"\\{[\\s\\S]*\\}", raw)
+        match = re.search(r"\{[\s\S]*\}", raw)
         if not match:
             log.warning("Groq response did not contain a JSON object; using local fallback.")
             return fallback_choose_clips(duration, transcript, observations, count)
