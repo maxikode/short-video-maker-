@@ -492,19 +492,33 @@ def make_srt(transcript, start: float, end: float, path: Path):
 
 
 def render_clip(video: Path, clip: dict, transcript, out_dir: Path, index: int, subtitles: bool):
+    """Render a vertical 9:16 short while keeping the complete source frame visible."""
     target = out_dir / f"clip_{index:02}.mp4"
     start, end = clip["start"], clip["end"]
     args = ["-ss", f"{start:.3f}", "-i", str(video), "-t", f"{end-start:.3f}"]
-    filters = ["scale='min(1080,iw)':-2"]
+
+    # Blurred, enlarged background + fully visible original frame in front.
+    # This avoids cutting off people/text at the sides of landscape videos.
+    graph = (
+        "[0:v]split=2[bg][fg];"
+        "[bg]scale=1080:1920:force_original_aspect_ratio=increase,"
+        "crop=1080:1920,boxblur=22:10[bg];"
+        "[fg]scale=1080:1920:force_original_aspect_ratio=decrease[fg];"
+        "[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1"
+    )
     if subtitles:
         srt = out_dir / f"clip_{index:02}.srt"
         make_srt(transcript, start, end, srt)
         if srt.stat().st_size:
             escaped = str(srt).replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
-            filters.append(f"subtitles='{escaped}':force_style='FontSize=18,Outline=2,Shadow=1,Alignment=2,MarginV=28'")
-    args += ["-vf", ",".join(filters), "-c:v", "libx264", "-preset", "veryfast",
-             "-b:v", "1800k", "-maxrate", "2200k", "-bufsize", "4400k",
-             "-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart", str(target)]
+            graph += f",subtitles='{escaped}':force_style='FontSize=22,Outline=2,Shadow=1,Alignment=2,MarginV=80'"
+    graph += "[vout]"
+
+    args += ["-filter_complex", graph, "-map", "[vout]", "-map", "0:a?",
+             "-c:v", "libx264", "-preset", "veryfast",
+             "-b:v", "2500k", "-maxrate", "3000k", "-bufsize", "6000k",
+             "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
+             "-movflags", "+faststart", str(target)]
     run_ffmpeg(args, timeout=600)
     return target
 
